@@ -8473,6 +8473,23 @@ class TestFsdp2UnshardedParams:
 
         assert all(param.requires_grad for param in other_params)
 
+    def test_disable_adapter_rejects_partial_merge_before_mutating_state(self):
+        model = self.get_model(fsdp_module_names=())
+
+        with torch.no_grad():
+            model(self.get_input())
+        model.base_model.model.lin0.merge()
+
+        assert model.get_model_status().enabled is True
+        assert model._adapters_disabled is False
+
+        with pytest.raises(RuntimeError, match="both merged and unmerged adapter layers"):
+            with model.disable_adapter():
+                pass
+
+        assert model.get_model_status().enabled is True
+        assert model._adapters_disabled is False
+
     @pytest.mark.parametrize("operation", ["disable_adapter", "set_requires_grad", "set_adapter"])
     # FSDP wrapping by size can also give the base layer inside a LoRA layer its own FSDP module
     @pytest.mark.parametrize("fsdp_module_names", [("lin0",), ("lin0.base_layer", "lin0")])
