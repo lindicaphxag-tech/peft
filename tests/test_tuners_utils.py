@@ -940,6 +940,7 @@ class TestModelAndLayerStatus:
         assert status.available_adapters == ["default"]
         assert status.requires_grad == {"default": True}
         assert status.devices == {"default": ["cpu"]}
+        assert status.matched_by == {}
 
     def test_with_trainable_tokens(self, small_base_emb_model_cls):
         # check that trainable_token_indices are correctly reported in layer status
@@ -987,6 +988,47 @@ class TestModelAndLayerStatus:
         ]
         assert result == expected
 
+    def test_target_module_match_coverage(self):
+        class UnevenTargetModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.block0 = nn.ModuleDict(
+                    {
+                        "q_proj": nn.Linear(4, 4),
+                        "v_proj": nn.Linear(4, 4),
+                    }
+                )
+                self.block1 = nn.ModuleDict({"q_proj": nn.Linear(4, 4)})
+
+        model = get_peft_model(
+            UnevenTargetModel(),
+            LoraConfig(target_modules=["q_proj", "v_proj"]),
+        )
+
+        layer_status = {status.name: status for status in model.get_layer_status()}
+        assert layer_status["model.block0.q_proj"].matched_by == {"default": ["q_proj"]}
+        assert layer_status["model.block0.v_proj"].matched_by == {"default": ["v_proj"]}
+        assert layer_status["model.block1.q_proj"].matched_by == {"default": ["q_proj"]}
+        assert model.get_model_status().target_module_matches == {
+            "default": {"q_proj": 2, "v_proj": 1}
+        }
+
+        model.add_adapter("other", LoraConfig(target_modules=["q_proj"]))
+        layer_status = {status.name: status for status in model.get_layer_status()}
+        assert layer_status["model.block0.q_proj"].matched_by == {
+            "default": ["q_proj"],
+            "other": ["q_proj"],
+        }
+        assert layer_status["model.block0.v_proj"].matched_by == {"default": ["v_proj"]}
+        assert model.get_model_status().target_module_matches == {
+            "default": {"q_proj": 2, "v_proj": 1},
+            "other": {"q_proj": 2},
+        }
+
+        regex = r".*\.(q|v)_proj$"
+        regex_model = get_peft_model(UnevenTargetModel(), LoraConfig(target_modules=regex))
+        assert regex_model.get_model_status().target_module_matches == {"default": {regex: 3}}
+
     def test_target_parameters(self, large_model):
         # don't check each attribute, just the relevant ones
         # first remove the normal LoRA layers
@@ -1006,6 +1048,7 @@ class TestModelAndLayerStatus:
         layer_status = large_model.get_layer_status()
         assert [status.name for status in layer_status] == ["model.lin0", "model.lin1"]
         assert [status.module_type for status in layer_status] == ["lora.ParamWrapper", "lora.Linear"]
+        assert [status.matched_by for status in layer_status] == [{}, {"default": ["lin1"]}]
 
     def test_quantization_backend_small(self, small_model):
         # non-quantized model should have quantization_backend=None
