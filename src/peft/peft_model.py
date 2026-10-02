@@ -1251,6 +1251,8 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
            The names of the available adapters, e.g. `["default"]`.
         - `quantization_backend` (`str` or `None`):
            The name of the quantization backend, e.g. `"bnb 4bit"`, or `None` if not quantized.
+        - `matched_by` (`dict[str, list[str]]`):
+           The configured target-module entries that matched this layer, grouped by adapter.
 
         Returns:
             list[`peft.peft_model.TunerLayerStatus`]:
@@ -1290,6 +1292,8 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         - `quantization_backend` (`str`, `None`, `Literal["irregular"]`):
            The name of the quantization backend, e.g. `"bnb 4bit"`, or `None` if not quantized. If the backend is not
            consistent across all layers, this will be `"irregular"`.
+        - `target_module_matches` (`dict[str, dict[str, int]]`):
+           The number of adapter layers matched by each configured target-module entry, grouped by adapter.
 
         Returns:
             `peft.peft_model.TunerModelStatus`:
@@ -3268,6 +3272,8 @@ def get_layer_status(model: torch.nn.Module) -> list[TunerLayerStatus]:
        The devices where the parameters of the given adapter are stored, e.g. `["cuda","xpu"]`.
     - `quantization_backend` (`str` or `None`):
        The name of the quantization backend, e.g. `"bnb 4bit"`, or `None` if not quantized.
+    - `matched_by` (`dict[str, list[str]]`):
+       The configured target-module entries that matched this layer, grouped by adapter.
 
     Args:
         model ([Union[`~PeftModel`, `~transformers.PreTrainedModel`, `nn.Module`]]):
@@ -3441,6 +3447,8 @@ def get_model_status(model: torch.nn.Module) -> TunerModelStatus:
     - `quantization_backend` (`str`, `None`, `Literal["irregular"]`):
        The name of the quantization backend, e.g. `"bnb 4bit"`, or `None` if not quantized. If the backend is not
        consistent across all layers, this will be `"irregular"`.
+    - `target_module_matches` (`dict[str, dict[str, int]]`):
+       The number of adapter layers matched by each configured target-module entry, grouped by adapter.
 
     Args:
         model ([Union[`~PeftModel`, `~transformers.PreTrainedModel`, `nn.Module`]]):
