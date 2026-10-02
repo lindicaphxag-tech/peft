@@ -41,7 +41,7 @@ from transformers.modeling_outputs import QuestionAnsweringModelOutput, Sequence
 from transformers.utils import PushToHubMixin
 
 from peft.tuners.lora.variants import get_alora_offsets_for_forward, get_alora_offsets_for_generate
-from peft.tuners.tuners_utils import BaseTuner, BaseTunerLayer, _delete_auxiliary_adapter
+from peft.tuners.tuners_utils import BaseTuner, BaseTunerLayer, _delete_auxiliary_adapter, check_target_module_exists
 from peft.utils import AuxiliaryTrainingWrapper
 from peft.utils.constants import DUMMY_MODEL_CONFIG
 from peft.utils.integrations import init_empty_weights
@@ -3239,6 +3239,7 @@ class TunerLayerStatus:
     available_adapters: list[str]
     devices: dict[str, list[str]]
     quantization_backend: str | None
+    matched_by: dict[str, list[str]] = dataclasses.field(default_factory=dict)
 
 
 def get_layer_status(model: torch.nn.Module) -> list[TunerLayerStatus]:
@@ -3286,6 +3287,11 @@ def get_layer_status(model: torch.nn.Module) -> list[TunerLayerStatus]:
             )
     else:
         base_model = model
+
+    peft_configs = getattr(base_model, "peft_config", {})
+    target_model = getattr(base_model, "model", base_model)
+    target_keys_by_module_id = {id(module): key for key, module in target_model.named_modules()}
+    target_matcher = getattr(base_model, "_check_target_module_exists", check_target_module_exists)
 
     layer_status: list[TunerLayerStatus] = []
     for name, module in base_model.named_modules():
@@ -3336,6 +3342,27 @@ def get_layer_status(model: torch.nn.Module) -> list[TunerLayerStatus]:
         quantization_backend = getattr(module, "quantization_backend", None)
         quantization_backend_name = quantization_backend.backend_name if quantization_backend is not None else None
 
+        matched_by: dict[str, list[str]] = {}
+        if isinstance(module, BaseTunerLayer):
+            target_key = target_keys_by_module_id.get(id(module))
+            if target_key is not None:
+                for adapter_name in sorted(module._get_available_adapters()):
+                    config = peft_configs.get(adapter_name)
+                    if config is None or not target_matcher(config, target_key):
+                        continue
+
+                    target_modules = getattr(config, "target_modules", None)
+                    if isinstance(target_modules, str):
+                        matched_by[adapter_name] = [target_modules]
+                    elif target_modules:
+                        matches = sorted(
+                            target
+                            for target in target_modules
+                            if target_key == target or target_key.endswith(f".{target}")
+                        )
+                        if matches:
+                            matched_by[adapter_name] = matches
+
         status = TunerLayerStatus(
             name=name,
             module_type=repr(module).partition("(")[0],
@@ -3346,6 +3373,7 @@ def get_layer_status(model: torch.nn.Module) -> list[TunerLayerStatus]:
             available_adapters=sorted(module._get_available_adapters()),
             devices=devices,
             quantization_backend=quantization_backend_name,
+            matched_by=matched_by,
         )
         layer_status.append(status)
 
@@ -3373,6 +3401,7 @@ class TunerModelStatus:
     available_adapters: list[str]
     devices: dict[str, list[str]]
     quantization_backend: str | None | Literal["irregular"]
+    target_module_matches: dict[str, dict[str, int]] = dataclasses.field(default_factory=dict)
 
 
 def get_model_status(model: torch.nn.Module) -> TunerModelStatus:
@@ -3509,6 +3538,24 @@ def get_model_status(model: torch.nn.Module) -> TunerModelStatus:
             devices_dd[key].extend(val)
     devices = {key: sorted(set(val)) for key, val in devices_dd.items()}
 
+    target_module_matches: dict[str, dict[str, int]] = {}
+    peft_configs = getattr(base_model, "peft_config", {})
+    for adapter_name, config in peft_configs.items():
+        target_modules = getattr(config, "target_modules", None)
+        if isinstance(target_modules, str):
+            targets = [target_modules]
+        elif target_modules:
+            targets = sorted(target_modules)
+        else:
+            targets = []
+        target_module_matches[adapter_name] = {target: 0 for target in targets}
+
+    for status in layer_status:
+        for adapter_name, targets in status.matched_by.items():
+            counts = target_module_matches.setdefault(adapter_name, {})
+            for target in targets:
+                counts[target] = counts.get(target, 0) + 1
+
     # check quant backend consistency
     quantization_backends_set: set[str | None] = {status.quantization_backend for status in layer_status}
     quantization_backend: str | None | Literal["irregular"]
@@ -3531,5 +3578,6 @@ def get_model_status(model: torch.nn.Module) -> TunerModelStatus:
         available_adapters=available_adapters,
         devices=devices,
         quantization_backend=quantization_backend,
+        target_module_matches=target_module_matches,
     )
     return adapter_model_status
