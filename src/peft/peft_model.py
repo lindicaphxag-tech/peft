@@ -1688,11 +1688,12 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
 
         # resharding drops the unsharded parameters, including weights that were merged into them, so FSDP modules
         # that shard parameters of a merged layer are skipped
+        tuner_layers = [module for module in self.modules() if isinstance(module, BaseTunerLayer)]
         merged_modules = {
-            submodule
-            for tuner_layer in self.modules()
-            if isinstance(tuner_layer, BaseTunerLayer) and tuner_layer.merged
-            for submodule in tuner_layer.modules()
+            submodule for tuner_layer in tuner_layers if tuner_layer.merged for submodule in tuner_layer.modules()
+        }
+        unmerged_modules = {
+            submodule for tuner_layer in tuner_layers if not tuner_layer.merged for submodule in tuner_layer.modules()
         }
         for fsdp_module in fsdp_modules:
             if merged_modules:
@@ -1702,7 +1703,19 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
                     module = stack.pop()
                     sharded_modules.add(module)
                     stack.extend(child for child in module.children() if child not in fsdp_modules)
-                if not sharded_modules.isdisjoint(merged_modules):
+
+                contains_merged = not sharded_modules.isdisjoint(merged_modules)
+                if contains_merged:
+                    # Resharding this unit would drop the unsharded merged weights. Skipping it is only safe when
+                    # there are no unmerged tuner layers in the same unit: otherwise changes such as requires_grad
+                    # would silently fail to reach those siblings' sharded parameters.
+                    if not sharded_modules.isdisjoint(unmerged_modules):
+                        raise RuntimeError(
+                            "Cannot update adapter state while an FSDP2 module contains both merged and unmerged "
+                            "adapter layers. Resharding would drop the merged weights, while skipping the reshard "
+                            "would leave the unmerged sibling adapters' sharded state stale. Unmerge the adapter "
+                            "layers in this FSDP2 module before calling this operation."
+                        )
                     continue
             fsdp_module.reshard()
 
