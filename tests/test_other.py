@@ -987,3 +987,37 @@ class TestTaskTypeModulesToSave:
 
         assert user_list == ["my_head"]
         assert model.peft_config["other"].modules_to_save == ["my_head"] + head_names
+
+class TestFSDP2MergedAdapterSwitch:
+    def test_set_adapter_unmerges_before_reshard(self):
+        class MLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lin = nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.lin(x)
+
+        config = LoraConfig(target_modules=["lin"], r=2, init_lora_weights=False)
+        model = get_peft_model(MLP(), config)
+        model.add_adapter("other", config)
+        model.merge_adapter()
+
+        events = []
+        original_unmerge = model.base_model.unmerge_adapter
+
+        def unmerge():
+            events.append("unmerge")
+            original_unmerge()
+
+        with (
+            patch("peft.peft_model.get_fsdp_modules", return_value=[object()]),
+            patch.object(model.base_model, "unmerge_adapter", side_effect=unmerge),
+            patch.object(model, "_reshard_fsdp_modules", side_effect=lambda: events.append("reshard")),
+        ):
+            model.set_adapter("other")
+
+        assert events == ["unmerge", "reshard"]
+        assert model.active_adapter == "other"
+        assert all(not module.merged for module in model.base_model.model.modules() if hasattr(module, "merged"))
+
