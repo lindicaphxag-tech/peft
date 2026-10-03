@@ -1,5 +1,4 @@
 import pytest
-import torch
 from torch import nn
 
 from peft import LoraConfig, get_peft_model
@@ -14,10 +13,14 @@ class TinyModel(nn.Module):
         return self.proj(x)
 
 
+def make_config():
+    return LoraConfig(r=2, lora_alpha=2, target_modules=["proj"], init_lora_weights=False)
+
+
+# Regression test for huggingface/peft#3872.
 def test_set_adapter_unmerges_before_fsdp_reshard(monkeypatch):
-    config = LoraConfig(r=2, lora_alpha=2, target_modules=["proj"], init_lora_weights=False)
-    model = get_peft_model(TinyModel(), config)
-    model.add_adapter("other", config)
+    model = get_peft_model(TinyModel(), make_config())
+    model.add_adapter("other", make_config())
     model.merge_adapter()
 
     events = []
@@ -47,9 +50,8 @@ def test_set_adapter_unmerges_before_fsdp_reshard(monkeypatch):
 
 
 def test_set_adapter_does_not_unmerge_when_model_is_unmerged(monkeypatch):
-    config = LoraConfig(r=2, lora_alpha=2, target_modules=["proj"], init_lora_weights=False)
-    model = get_peft_model(TinyModel(), config)
-    model.add_adapter("other", config)
+    model = get_peft_model(TinyModel(), make_config())
+    model.add_adapter("other", make_config())
 
     events = []
     original_set_adapter = model.base_model.set_adapter
