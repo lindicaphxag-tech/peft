@@ -8456,6 +8456,40 @@ class TestFsdp2UnshardedParams:
         model.set_requires_grad("default", requires_grad=False)
         assert not any(param.requires_grad for param in other_params)
 
+    @pytest.mark.parametrize("merged_name, other_name", [("lin0", "lin1"), ("lin1", "lin0")])
+    def test_set_requires_grad_rejects_partial_merge_in_same_fsdp_module(self, merged_name, other_name):
+        # If merged and unmerged tuner layers share one FSDP unit, resharding would drop the merged weight while
+        # skipping the reshard would leave the sibling adapter's sharded requires_grad state stale.
+        model = self.get_model(fsdp_module_names=())
+        other_params = [param for name, param in model.named_parameters() if f".{other_name}.lora_" in name]
+        assert len(other_params) == 2
+
+        with torch.no_grad():
+            model(self.get_input())
+        model.base_model.model.get_submodule(merged_name).merge()
+
+        with pytest.raises(RuntimeError, match="both merged and unmerged adapter layers"):
+            model.set_requires_grad("default", requires_grad=False)
+
+        assert all(param.requires_grad for param in other_params)
+
+    def test_disable_adapter_rejects_partial_merge_before_mutating_state(self):
+        model = self.get_model(fsdp_module_names=())
+
+        with torch.no_grad():
+            model(self.get_input())
+        model.base_model.model.lin0.merge()
+
+        assert model.get_model_status().enabled is True
+        assert model._adapters_disabled is False
+
+        with pytest.raises(RuntimeError, match="both merged and unmerged adapter layers"):
+            with model.disable_adapter():
+                pass
+
+        assert model.get_model_status().enabled is True
+        assert model._adapters_disabled is False
+
     @pytest.mark.parametrize("operation", ["disable_adapter", "set_requires_grad", "set_adapter"])
     # FSDP wrapping by size can also give the base layer inside a LoRA layer its own FSDP module
     @pytest.mark.parametrize("fsdp_module_names", [("lin0",), ("lin0.base_layer", "lin0")])

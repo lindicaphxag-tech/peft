@@ -1080,6 +1080,10 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
                     "This is most likely unintentional. After exiting the disable_adapter context, all adapters "
                     "will be enabled"
                 )
+            if model_status.enabled is not False:
+                # Validate before mutating adapter state, so an unsupported mixed merged/unmerged FSDP2 unit fails
+                # transactionally instead of raising only while the context manager is unwinding.
+                self._get_fsdp_modules_to_reshard()
             try:
                 self.base_model.disable_adapter_layers()
                 self._adapters_disabled = True
@@ -1676,24 +1680,24 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         self._reshard_fsdp_modules()
         self.base_model.set_requires_grad(adapter_names=adapter_names, requires_grad=requires_grad)
 
-    def _reshard_fsdp_modules(self) -> None:
-        """
-        Reshard the FSDP2 modules in this model, including itself, so that changes to `requires_grad` land on the
-        sharded parameters. Must be called on all ranks, since a resharded module is all-gathered again in its next
-        forward.
-        """
+    def _get_fsdp_modules_to_reshard(self) -> list[torch.nn.Module]:
+        """Return FSDP2 modules that can be safely resharded for an adapter-state update."""
         fsdp_modules = set(get_fsdp_modules(self))
         if not fsdp_modules:
-            return
+            return []
 
-        # resharding drops the unsharded parameters, including weights that were merged into them, so FSDP modules
-        # that shard parameters of a merged layer are skipped
+        # Resharding drops unsharded parameters, including weights merged into them. Skipping a whole FSDP unit is
+        # only safe when every tuner layer whose parameters it shards is merged; otherwise an unmerged sibling would
+        # keep stale sharded adapter state.
+        tuner_layers = [module for module in self.modules() if isinstance(module, BaseTunerLayer)]
         merged_modules = {
-            submodule
-            for tuner_layer in self.modules()
-            if isinstance(tuner_layer, BaseTunerLayer) and tuner_layer.merged
-            for submodule in tuner_layer.modules()
+            submodule for tuner_layer in tuner_layers if tuner_layer.merged for submodule in tuner_layer.modules()
         }
+        unmerged_modules = {
+            submodule for tuner_layer in tuner_layers if not tuner_layer.merged for submodule in tuner_layer.modules()
+        }
+
+        modules_to_reshard = []
         for fsdp_module in fsdp_modules:
             if merged_modules:
                 # an FSDP module shards the parameters of its submodules, except those inside nested FSDP modules
@@ -1702,8 +1706,26 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
                     module = stack.pop()
                     sharded_modules.add(module)
                     stack.extend(child for child in module.children() if child not in fsdp_modules)
+
                 if not sharded_modules.isdisjoint(merged_modules):
+                    if not sharded_modules.isdisjoint(unmerged_modules):
+                        raise RuntimeError(
+                            "Cannot update adapter state while an FSDP2 module contains both merged and unmerged "
+                            "adapter layers. Resharding would drop the merged weights, while skipping the reshard "
+                            "would leave the unmerged sibling adapters' sharded state stale. Unmerge the adapter "
+                            "layers in this FSDP2 module before calling this operation."
+                        )
                     continue
+            modules_to_reshard.append(fsdp_module)
+        return modules_to_reshard
+
+    def _reshard_fsdp_modules(self) -> None:
+        """
+        Reshard the FSDP2 modules in this model, including itself, so that changes to `requires_grad` land on the
+        sharded parameters. Must be called on all ranks, since a resharded module is all-gathered again in its next
+        forward.
+        """
+        for fsdp_module in self._get_fsdp_modules_to_reshard():
             fsdp_module.reshard()
 
     @property
