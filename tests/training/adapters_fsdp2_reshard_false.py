@@ -46,7 +46,7 @@ def log(msg):
         print(msg, flush=True)
 
 
-def get_model(device, mesh=None):
+def get_model(device, mesh=None, add_other_adapter=False):
     torch.manual_seed(0)
     config = LlamaConfig(
         vocab_size=128,
@@ -58,7 +58,10 @@ def get_model(device, mesh=None):
         tie_word_embeddings=False,
     )
     model = LlamaForCausalLM(config).to(device)
-    model = get_peft_model(model, LoraConfig(r=8, target_modules=TARGET_MODULES, init_lora_weights=False))
+    lora_config = LoraConfig(r=8, target_modules=TARGET_MODULES, init_lora_weights=False)
+    model = get_peft_model(model, lora_config)
+    if add_other_adapter:
+        model.add_adapter("other", lora_config)
     if mesh is not None:
         for layer in model.base_model.model.model.layers:
             fully_shard(layer, mesh=mesh, reshard_after_forward=False)
@@ -66,9 +69,16 @@ def get_model(device, mesh=None):
     return model
 
 
-def get_lora_params(model):
+def get_lora_params(model, adapter_name=None):
     # before the first forward, these are the sharded parameters that FSDP2 keeps
-    return [param for name, param in model.named_parameters() if "lora_" in name]
+    params = []
+    for name, param in model.named_parameters():
+        if "lora_" not in name:
+            continue
+        if adapter_name is not None and f".{adapter_name}." not in name:
+            continue
+        params.append(param)
+    return params
 
 
 def get_full_tensor(tensor):
@@ -113,6 +123,46 @@ def test_disable_adapter_keeps_adapters_trainable(device, mesh, input_ids):
         assert num_updated == len(lora_params), f"step {step}: {num_updated}/{len(lora_params)} LoRA params updated"
 
 
+def test_set_adapter_after_merge_updates_fsdp2_shards(device, mesh, input_ids):
+    # set_adapter() already auto-unmerges tuner layers. Under FSDP2, that unmerge must happen before the reshard so the
+    # newly activated adapter's requires_grad state is written back to the sharded parameters.
+    results = []
+    for model_mesh in (mesh, None):
+        model = get_model(device, model_mesh, add_other_adapter=True)
+
+        # With reshard_after_forward=False, the FSDP2 modules remain unsharded after this forward, which makes the merge
+        # operation exercise the same ordering as the reported failure.
+        with torch.no_grad():
+            model(input_ids)
+
+        model.merge_adapter()
+        model.set_adapter("other")
+
+        other_params = get_lora_params(model, "other")
+        default_params = get_lora_params(model, "default")
+        assert other_params, "expected parameters for the 'other' adapter"
+        assert default_params, "expected parameters for the 'default' adapter"
+        assert all(param.requires_grad for param in other_params)
+        assert all(not param.requires_grad for param in default_params)
+
+        optimizer = torch.optim.SGD(other_params, lr=LEARNING_RATE)
+        losses = []
+        for step in range(2):
+            before = [get_full_tensor(param) for param in other_params]
+            losses.append(train_step(model, optimizer, input_ids))
+            after = [get_full_tensor(param) for param in other_params]
+            num_updated = sum(not torch.equal(x, y) for x, y in zip(before, after))
+            assert num_updated == len(other_params), (
+                f"step {step}: {num_updated}/{len(other_params)} 'other' adapter parameters updated"
+            )
+        results.append((losses, [get_full_tensor(param) for param in other_params]))
+
+    (fsdp_losses, fsdp_params), (losses, params) = results
+    log(f"merge -> set_adapter losses with FSDP2: {fsdp_losses}, without: {losses}")
+    torch.testing.assert_close(fsdp_losses, losses, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(fsdp_params, params, rtol=1e-4, atol=1e-5)
+
+
 def test_training_matches_unsharded_model(device, mesh, input_ids):
     # an RL-like loop: one reference pass with the adapters disabled, followed by two training steps with a KL term;
     # every rank uses the same batch, so the FSDP2 run has to match the unsharded model
@@ -147,6 +197,7 @@ def main():
     input_ids = torch.randint(0, 128, (4, 16), generator=torch.Generator().manual_seed(0)).to(device)
 
     test_disable_adapter_keeps_adapters_trainable(device, mesh, input_ids)
+    test_set_adapter_after_merge_updates_fsdp2_shards(device, mesh, input_ids)
     test_training_matches_unsharded_model(device, mesh, input_ids)
     log("All checks passed")
     dist.destroy_process_group()
