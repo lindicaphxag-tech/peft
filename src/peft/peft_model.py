@@ -1651,7 +1651,10 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         # before that call so that requires_grad changes are applied to the sharded parameters. If a merged tuner layer
         # shares an FSDP unit with the adapter being activated, _reshard_fsdp_modules() intentionally skips that whole
         # unit to preserve the merged weights. Unmerge first so the unit can be resharded safely before switching.
-        if get_fsdp_modules(self) and hasattr(self.base_model, "unmerge_adapter"):
+        has_merged_tuner_layer = any(
+            isinstance(module, BaseTunerLayer) and module.merged for module in self.modules()
+        )
+        if get_fsdp_modules(self) and has_merged_tuner_layer and hasattr(self.base_model, "unmerge_adapter"):
             self.base_model.unmerge_adapter()
 
         self._reshard_fsdp_modules()
