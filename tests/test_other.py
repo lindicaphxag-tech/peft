@@ -1000,7 +1000,7 @@ class TestFSDP2MergedAdapterSwitch:
 
         config = LoraConfig(target_modules=["lin"], r=2, init_lora_weights=False)
         model = get_peft_model(MLP(), config)
-        model.add_adapter("other", config)
+        model.add_adapter("other", LoraConfig(target_modules=["lin"], r=2, init_lora_weights=False))
         model.merge_adapter()
 
         events = []
