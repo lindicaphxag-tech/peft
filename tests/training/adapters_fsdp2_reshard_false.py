@@ -61,7 +61,10 @@ def get_model(device, mesh=None, add_other_adapter=False):
     lora_config = LoraConfig(r=8, target_modules=TARGET_MODULES, init_lora_weights=False)
     model = get_peft_model(model, lora_config)
     if add_other_adapter:
-        model.add_adapter("other", lora_config)
+        model.add_adapter(
+            "other",
+            LoraConfig(r=8, target_modules=TARGET_MODULES, init_lora_weights=False),
+        )
     if mesh is not None:
         for layer in model.base_model.model.model.layers:
             fully_shard(layer, mesh=mesh, reshard_after_forward=False)
