@@ -1646,6 +1646,14 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         """
         if adapter_name not in self.peft_config:
             raise ValueError(f"Adapter {adapter_name} not found.")
+
+        # BaseTuner.set_adapter() unmerges merged tuner layers automatically, but FSDP2 resharding has to happen
+        # before that call so that requires_grad changes are applied to the sharded parameters. If a merged tuner layer
+        # shares an FSDP unit with the adapter being activated, _reshard_fsdp_modules() intentionally skips that whole
+        # unit to preserve the merged weights. Unmerge first so the unit can be resharded safely before switching.
+        if get_fsdp_modules(self) and hasattr(self.base_model, "unmerge_adapter"):
+            self.base_model.unmerge_adapter()
+
         self._reshard_fsdp_modules()
         self.active_adapter = adapter_name
         if not self.peft_config[adapter_name].is_prompt_learning:
