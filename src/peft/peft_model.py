@@ -41,7 +41,7 @@ from transformers.modeling_outputs import QuestionAnsweringModelOutput, Sequence
 from transformers.utils import PushToHubMixin
 
 from peft.tuners.lora.variants import get_alora_offsets_for_forward, get_alora_offsets_for_generate
-from peft.tuners.tuners_utils import BaseTuner, BaseTunerLayer, _delete_auxiliary_adapter
+from peft.tuners.tuners_utils import BaseTuner, BaseTunerLayer, _delete_auxiliary_adapter, check_target_module_exists
 from peft.utils import AuxiliaryTrainingWrapper
 from peft.utils.constants import DUMMY_MODEL_CONFIG
 from peft.utils.integrations import get_fsdp_modules, init_empty_weights
@@ -3263,6 +3263,23 @@ class PeftModelForFeatureExtraction(PeftModel):
             return self.base_model(inputs_embeds=inputs_embeds, **kwargs)
 
 
+def _target_patterns_matching_layer(config: PeftConfig, layer_name: str) -> list[str]:
+    """Return configured target-module patterns that match one injected layer."""
+    target_modules = getattr(config, "target_modules", None)
+    if not target_modules or not check_target_module_exists(config, layer_name):
+        return []
+
+    if isinstance(target_modules, str):
+        # A string target_modules value is one regex, so it has one coverage bucket.
+        return [target_modules]
+
+    return sorted(
+        target
+        for target in target_modules
+        if (layer_name == target) or layer_name.endswith(f".{target}")
+    )
+
+
 @dataclass
 class TunerLayerStatus:
     name: str
@@ -3274,6 +3291,7 @@ class TunerLayerStatus:
     available_adapters: list[str]
     devices: dict[str, list[str]]
     quantization_backend: str | None
+    matched_by: dict[str, list[str]]
 
 
 def get_layer_status(model: torch.nn.Module) -> list[TunerLayerStatus]:
@@ -3302,6 +3320,9 @@ def get_layer_status(model: torch.nn.Module) -> list[TunerLayerStatus]:
        The devices where the parameters of the given adapter are stored, e.g. `["cuda","xpu"]`.
     - `quantization_backend` (`str` or `None`):
        The name of the quantization backend, e.g. `"bnb 4bit"`, or `None` if not quantized.
+    - `matched_by` (`dict[str, list[str]]`):
+       For each adapter available on this layer, the configured `target_modules` patterns that match the layer name.
+       Auxiliary wrappers and parameter-targeted adapters have no target-module match and are omitted.
 
     Args:
         model ([Union[`~PeftModel`, `~transformers.PreTrainedModel`, `nn.Module`]]):
@@ -3371,6 +3392,17 @@ def get_layer_status(model: torch.nn.Module) -> list[TunerLayerStatus]:
         quantization_backend = getattr(module, "quantization_backend", None)
         quantization_backend_name = quantization_backend.backend_name if quantization_backend is not None else None
 
+        available_adapters = sorted(module._get_available_adapters())
+        peft_configs = getattr(base_model, "peft_config", {})
+        matched_by = {}
+        for adapter_name in available_adapters:
+            config = peft_configs.get(adapter_name)
+            if config is None:
+                continue
+            matches = _target_patterns_matching_layer(config, name)
+            if matches:
+                matched_by[adapter_name] = matches
+
         status = TunerLayerStatus(
             name=name,
             module_type=repr(module).partition("(")[0],
@@ -3378,9 +3410,10 @@ def get_layer_status(model: torch.nn.Module) -> list[TunerLayerStatus]:
             active_adapters=module.active_adapters,
             merged_adapters=module.merged_adapters,
             requires_grad=requires_grad,
-            available_adapters=sorted(module._get_available_adapters()),
+            available_adapters=available_adapters,
             devices=devices,
             quantization_backend=quantization_backend_name,
+            matched_by=matched_by,
         )
         layer_status.append(status)
 
@@ -3408,6 +3441,7 @@ class TunerModelStatus:
     available_adapters: list[str]
     devices: dict[str, list[str]]
     quantization_backend: str | None | Literal["irregular"]
+    target_module_matches: dict[str, dict[str, int]]
 
 
 def get_model_status(model: torch.nn.Module) -> TunerModelStatus:
@@ -3447,6 +3481,9 @@ def get_model_status(model: torch.nn.Module) -> TunerModelStatus:
     - `quantization_backend` (`str`, `None`, `Literal["irregular"]`):
        The name of the quantization backend, e.g. `"bnb 4bit"`, or `None` if not quantized. If the backend is not
        consistent across all layers, this will be `"irregular"`.
+    - `target_module_matches` (`dict[str, dict[str, int]]`):
+       Per adapter, the number of injected adapter layers matched by each configured `target_modules` pattern. Regex
+       `target_modules` values are reported as one aggregate pattern. This is diagnostic only and does not alter matching.
 
     Args:
         model ([Union[`~PeftModel`, `~transformers.PreTrainedModel`, `nn.Module`]]):
@@ -3552,6 +3589,23 @@ def get_model_status(model: torch.nn.Module) -> TunerModelStatus:
     else:
         quantization_backend = "irregular"
 
+    # Report target-module coverage per adapter. Initialize configured patterns
+    # to zero so status inspection can reveal a target that matched no injected
+    # layer without changing the matching/injection behavior itself.
+    target_module_matches: dict[str, dict[str, int]] = {}
+    for adapter_name, config in getattr(base_model, "peft_config", {}).items():
+        target_modules = getattr(config, "target_modules", None)
+        if not target_modules:
+            continue
+        patterns = [target_modules] if isinstance(target_modules, str) else sorted(target_modules)
+        target_module_matches[adapter_name] = {pattern: 0 for pattern in patterns}
+
+    for status in layer_status:
+        for adapter_name, patterns in status.matched_by.items():
+            adapter_counts = target_module_matches.setdefault(adapter_name, {})
+            for pattern in patterns:
+                adapter_counts[pattern] = adapter_counts.get(pattern, 0) + 1
+
     adapter_model_status = TunerModelStatus(
         base_model_type=base_model_type,
         adapter_model_type=adapter_model_type,
@@ -3566,5 +3620,6 @@ def get_model_status(model: torch.nn.Module) -> TunerModelStatus:
         available_adapters=available_adapters,
         devices=devices,
         quantization_backend=quantization_backend,
+        target_module_matches=target_module_matches,
     )
     return adapter_model_status

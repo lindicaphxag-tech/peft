@@ -771,6 +771,27 @@ class TestModelAndLayerStatus:
         result = sorted([status.module_type for status in layer_status])
         expected = ["lora.Conv2d", "lora.Embedding", "lora.Linear", "lora.Linear"]
         assert result == expected
+    def test_target_module_matches_large(self, large_model):
+        status_by_name = {status.name: status for status in large_model.get_layer_status()}
+
+        assert status_by_name["model.lin0"].matched_by == {
+            "default": ["lin0"],
+            "other": ["lin0"],
+        }
+        assert status_by_name["model.conv1"].matched_by == {"default": ["conv1"]}
+        assert status_by_name["model.emb0"].matched_by == {"default": ["emb0"]}
+        assert status_by_name["model.lin1"].matched_by == {"other": ["lin1"]}
+
+    def test_target_module_matches_regex(self, small_base_model_cls):
+        pattern = r".*lin[01]$"
+        model = get_peft_model(small_base_model_cls(), LoraConfig(target_modules=pattern))
+
+        layer_status = model.get_layer_status()
+        assert {status.name: status.matched_by for status in layer_status} == {
+            "model.lin0": {"default": [pattern]},
+            "model.lin1": {"default": [pattern]},
+        }
+        assert model.get_model_status().target_module_matches == {"default": {pattern: 2}}
 
     def test_enabled_small(self, small_model):
         layer_status = small_model.get_layer_status()
@@ -940,6 +961,7 @@ class TestModelAndLayerStatus:
         assert status.available_adapters == ["default"]
         assert status.requires_grad == {"default": True}
         assert status.devices == {"default": ["cpu"]}
+        assert status.matched_by == {}
 
     def test_with_trainable_tokens(self, small_base_emb_model_cls):
         # check that trainable_token_indices are correctly reported in layer status
@@ -1104,6 +1126,12 @@ class TestModelAndLayerStatus:
     def test_num_adapter_layers_large(self, large_model):
         model_status = large_model.get_model_status()
         assert model_status.num_adapter_layers == 4
+    def test_target_module_matches_model_large(self, large_model):
+        model_status = large_model.get_model_status()
+        assert model_status.target_module_matches == {
+            "default": {"conv1": 1, "emb0": 1, "lin0": 1},
+            "other": {"lin0": 1, "lin1": 1},
+        }
 
     def test_model_enabled_small(self, small_model):
         model_status = small_model.get_model_status()
