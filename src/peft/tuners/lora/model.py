@@ -291,6 +291,50 @@ class LoraModel(BaseTuner):
                     f"{sorted(other_target_parameters)} for adapter '{adapter_name}'."
                 )
 
+    def _cast_adapter_dtype(self, adapter_name: str, autocast_adapter_dtype: bool = True) -> None:
+        """Upcast low-precision LoRA weights without losing explicitly tied adapters.
+
+        Generic dtype casting replaces Parameter objects. The output linear
+        LoRA matrices share transposed storage with the input embedding
+        matrices, so casting them independently silently breaks their tie.
+        Rebuild those views *after* the embedding matrices have been cast.
+        """
+        super()._cast_adapter_dtype(adapter_name, autocast_adapter_dtype=autocast_adapter_dtype)
+        if not autocast_adapter_dtype:
+            return
+        config = self.peft_config[adapter_name]
+        target_names = getattr(config, "target_modules_to_tie", None) or []
+        if not target_names:
+            return
+
+        embeddings = self.model.get_input_embeddings()
+        if not hasattr(embeddings, "lora_embedding_A") or adapter_name not in embeddings.lora_embedding_A:
+            return
+        embed_a = embeddings.lora_embedding_A[adapter_name]
+        embed_b = embeddings.lora_embedding_B[adapter_name]
+        # In the existing fp32 creation path, lora_A is a transposed view
+        # of embed_B, and lora_B is a transposed view of embed_A.
+        for name, module in self.model.named_modules():
+            if name not in target_names and not any(name.endswith("." + key) for key in target_names):
+                continue
+            if not hasattr(module, "lora_A") or adapter_name not in module.lora_A:
+                continue
+            if adapter_name not in module.lora_B:
+                continue
+            a_weight = module.lora_A[adapter_name].weight
+            b_weight = module.lora_B[adapter_name].weight
+            if a_weight.shape != embed_b.T.shape or b_weight.shape != embed_a.T.shape:
+                raise ValueError("Tied LoRA adapter dimensions are inconsistent after dtype casting")
+            # New Parameter views preserve storage identity and the exact
+            # existing transposed tied-LoRA semantics, even if the generic
+            # cast replaced the original embedding Parameter objects.
+            module.lora_A[adapter_name].weight = nn.Parameter(
+                embed_b.T, requires_grad=a_weight.requires_grad
+            )
+            module.lora_B[adapter_name].weight = nn.Parameter(
+                embed_a.T, requires_grad=b_weight.requires_grad
+            )
+
     def _create_and_replace(
         self,
         lora_config,
