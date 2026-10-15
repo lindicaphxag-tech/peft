@@ -645,7 +645,11 @@ class Linear(nn.Module, OFTLayer):
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
-            for active_adapter in self.active_adapters:
+            # merge() left-multiplies the transposed base weight by each
+            # adapter's rotation in active-adapter order. For non-commuting
+            # rotations, input-space forward must apply them in reverse order.
+            # A single active adapter keeps its existing behavior.
+            for active_adapter in reversed(self.active_adapters):
                 if active_adapter not in self.oft_R.keys():
                     continue
                 oft_R = self.oft_R[active_adapter]

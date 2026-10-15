@@ -1,0 +1,31 @@
+name: OFT Linear multi-adapter merge order
+on:
+  push:
+    branches: [fix/oft-linear-multi-adapter-merge-order-20261015]
+  pull_request:
+    paths:
+      - "src/peft/tuners/oft/layer.py"
+      - "tests/test_oft_linear_multi_adapter_merge_order.py"
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install project and test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "torch>=2.3" pytest pytest-cov "ruff==0.16.4"
+          python -m pip install -e .
+      - name: Validate Python style
+        run: |
+          python -m ruff check tests/test_oft_linear_multi_adapter_merge_order.py
+          python -m ruff format --check tests/test_oft_linear_multi_adapter_merge_order.py
+      - name: Run OFT Linear correctness regressions
+        run: python -m pytest -q -o addopts="" tests/test_oft_linear_multi_adapter_merge_order.py
