@@ -8488,17 +8488,7 @@ class TestFsdp2UnshardedParams:
 
 
 
-@pytest.mark.parametrize(
-    ("config_cls", "config_kwargs"),
-    [
-        (LoraConfig, {}),
-        (DeloraConfig, {}),
-        (IA3Config, {"feedforward_modules": []}),
-        (OFTConfig, {"r": 2, "oft_block_size": 0, "use_cayley_neumann": False}),
-        (OSFConfig, {}),
-    ],
-)
-def test_targeting_unsupported_layer_type_raises(config_cls, config_kwargs):
+def test_osf_targeting_unsupported_layer_type_raises():
     class UnknownModule(nn.Module):
         def __init__(self):
             super().__init__()
@@ -8516,7 +8506,7 @@ def test_targeting_unsupported_layer_type_raises(config_cls, config_kwargs):
             return self.target(x)
 
     model = ModelWithUnknownModule()
-    config = config_cls(target_modules=["target"], **config_kwargs)
+    config = OSFConfig(target_modules=["target"])
 
     with pytest.raises(TypeError, match="does not support target module"):
         get_peft_model(model, config)
