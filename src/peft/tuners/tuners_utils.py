@@ -978,6 +978,14 @@ class BaseTuner(nn.Module, ABC):
                         self._create_and_replace(
                             peft_config, adapter_name, target, target_name, parent, current_key=key
                         )
+                    # A matched target must either be wrapped by the tuner or already be
+                    # a tuner layer being updated in place. Silently leaving an unsupported
+                    # module untouched makes the requested adapter a partial no-op.
+                    if parent._modules.get(target_name) is target and not isinstance(target, BaseTunerLayer):
+                        raise TypeError(
+                            f"{self.__class__.__name__} does not support target module "
+                            f"{key!r} of type {type(target).__name__}."
+                        )
             else:
                 # defensively remove _orig_mod prefix in case the model is compiled
                 key = key.removeprefix("_orig_mod.")
@@ -999,6 +1007,11 @@ class BaseTuner(nn.Module, ABC):
                     with ctx():
                         self._create_and_replace(
                             peft_config, adapter_name, target, target_name, parent, current_key=key
+                        )
+                    if parent._modules.get(target_name) is target and not isinstance(target, BaseTunerLayer):
+                        raise TypeError(
+                            f"{self.__class__.__name__} does not support target module "
+                            f"{key!r} of type {type(target).__name__}."
                         )
 
                 # still record what would have been matched via the config so that the two results can be compared
