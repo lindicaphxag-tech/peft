@@ -8485,3 +8485,38 @@ class TestFsdp2UnshardedParams:
         for name, base_weight in base_weights.items():
             weight = state_dict[f"base_model.model.{name}.base_layer.weight"].full_tensor()
             assert torch.allclose(weight, base_weight, atol=1e-6)
+
+
+
+@pytest.mark.parametrize(
+    ("config_cls", "config_kwargs"),
+    [
+        (LoraConfig, {}),
+        (DeloraConfig, {}),
+        (IA3Config, {"feedforward_modules": []}),
+        (OFTConfig, {"r": 2, "oft_block_size": 0, "use_cayley_neumann": False}),
+        (OSFConfig, {}),
+    ],
+)
+def test_targeting_unsupported_layer_type_raises(config_cls, config_kwargs):
+    class UnknownModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(10, 10))
+
+        def forward(self, x):
+            return x @ self.weight.t()
+
+    class ModelWithUnknownModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.target = UnknownModule()
+
+        def forward(self, x):
+            return self.target(x)
+
+    model = ModelWithUnknownModule()
+    config = config_cls(target_modules=["target"], **config_kwargs)
+
+    with pytest.raises(TypeError, match="does not support target module"):
+        get_peft_model(model, config)
