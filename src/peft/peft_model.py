@@ -1012,18 +1012,50 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             yield
             return
 
+    @contextmanager
+    def _disable_native_mha_fastpath_for_unmerged_adapters(self):
+        """Disable PyTorch's fused TransformerEncoder path when it would bypass PEFT layers."""
+        mha_backend = getattr(torch.backends, "mha", None)
+        if mha_backend is None or not self.has_active_enabled_adapter:
+            yield
+            return
+
+        has_unmerged_tuner_layer = any(
+            isinstance(module, BaseTunerLayer) and not module.merged and not module.disable_adapters
+            for module in self.base_model.modules()
+        )
+        has_native_encoder = any(
+            isinstance(module, torch.nn.TransformerEncoder) for module in self.get_base_model().modules()
+        )
+        if not has_unmerged_tuner_layer or not has_native_encoder:
+            yield
+            return
+
+        previous = mha_backend.get_fastpath_enabled()
+        if not previous:
+            yield
+            return
+
+        mha_backend.set_fastpath_enabled(False)
+        try:
+            yield
+        finally:
+            mha_backend.set_fastpath_enabled(previous)
+
     def forward(self, *args: Any, **kwargs: Any):
         """
         Forward pass of the model.
         """
-        with self._enable_peft_forward_hooks(*args, **kwargs):
-            kwargs = {k: v for k, v in kwargs.items() if k not in self.special_peft_forward_args}
-            return self.get_base_model()(*args, **kwargs)
+        with self._disable_native_mha_fastpath_for_unmerged_adapters():
+            with self._enable_peft_forward_hooks(*args, **kwargs):
+                kwargs = {k: v for k, v in kwargs.items() if k not in self.special_peft_forward_args}
+                return self.get_base_model()(*args, **kwargs)
 
     def generate(self, *args, **kwargs):
-        with self._enable_peft_forward_hooks(*args, **kwargs):
-            kwargs = {k: v for k, v in kwargs.items() if k not in self.special_peft_forward_args}
-            return self.get_base_model().generate(*args, **kwargs)
+        with self._disable_native_mha_fastpath_for_unmerged_adapters():
+            with self._enable_peft_forward_hooks(*args, **kwargs):
+                kwargs = {k: v for k, v in kwargs.items() if k not in self.special_peft_forward_args}
+                return self.get_base_model().generate(*args, **kwargs)
 
     def _get_base_model_class(self, is_prompt_tuning=False):
         """
