@@ -137,6 +137,49 @@ def _add_modules_to_save(peft_config: PeftConfig, module_names: Sequence[str]) -
         peft_config.modules_to_save = existing + [name for name in module_names if name not in existing]
 
 
+def _disable_transformer_encoder_fastpath_for_tuner_layers(model: torch.nn.Module) -> None:
+    """Prevent PyTorch's fused TransformerEncoder path from bypassing PEFT-wrapped linears.
+
+    PyTorch's fused TransformerEncoderLayer kernel reads `.weight` and `.bias` directly for
+    `linear1`, `linear2`, and `self_attn.out_proj`; it does not call those modules' `forward()`
+    methods. PEFT adapters apply their unmerged contribution in `forward()`, so the fused path
+    silently drops the adapter. Mark affected layers as ineligible for that kernel while leaving
+    their actual activation unchanged. Also disable nested-tensor conversion on containing
+    TransformerEncoder modules, because that outer fast path requires the fused layer path.
+    """
+    affected_layer_ids: set[int] = set()
+
+    for layer in model.modules():
+        if not isinstance(layer, torch.nn.TransformerEncoderLayer):
+            continue
+
+        self_attn = getattr(layer, "self_attn", None)
+        fastpath_modules = (
+            getattr(layer, "linear1", None),
+            getattr(layer, "linear2", None),
+            getattr(self_attn, "out_proj", None),
+        )
+        has_tuner_layer = any(
+            module is not None and any(isinstance(child, BaseTunerLayer) for child in module.modules())
+            for module in fastpath_modules
+        )
+        if has_tuner_layer:
+            # PyTorch uses this flag only to decide whether to enter the fused kernel;
+            # the slow path still calls layer.activation and preserves its configured semantics.
+            layer.activation_relu_or_gelu = 0
+            affected_layer_ids.add(id(layer))
+
+    if not affected_layer_ids:
+        return
+
+    for encoder in model.modules():
+        if isinstance(encoder, torch.nn.TransformerEncoder) and any(
+            id(layer) in affected_layer_ids for layer in encoder.layers
+        ):
+            if hasattr(encoder, "use_nested_tensor"):
+                encoder.use_nested_tensor = False
+
+
 class PeftModel(PushToHubMixin, torch.nn.Module):
     """
     Base model encompassing various Peft methods.
@@ -211,6 +254,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             self.base_model.config.pretraining_tp = 1
 
         self._adapters_disabled = False
+        _disable_transformer_encoder_fastpath_for_tuner_layers(self.base_model)
 
     @property
     def peft_config(self) -> dict[str, PeftConfig]:
@@ -1186,6 +1230,8 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             self.base_model._cast_adapter_dtype(
                 adapter_name=adapter_name, autocast_adapter_dtype=autocast_adapter_dtype
             )
+
+        _disable_transformer_encoder_fastpath_for_tuner_layers(self.base_model)
 
     def delete_adapter(self, adapter_name: str) -> None:
         """
