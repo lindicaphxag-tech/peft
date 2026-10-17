@@ -26,7 +26,9 @@ class NativeTransformerEncoderModel(nn.Module):
 
 @pytest.mark.parametrize("use_padding_mask", [False, True])
 def test_lora_adapter_is_preserved_with_transformer_encoder_fastpath(use_padding_mask):
-    if not hasattr(torch.backends, "mha") or not hasattr(torch.backends.mha, "set_fastpath_enabled"):
+    if not hasattr(torch.backends, "mha") or not all(
+        hasattr(torch.backends.mha, name) for name in ("get_fastpath_enabled", "set_fastpath_enabled")
+    ):
         pytest.skip("PyTorch TransformerEncoder fastpath controls are unavailable")
 
     torch.manual_seed(42)
