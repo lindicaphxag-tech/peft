@@ -138,14 +138,14 @@ def _add_modules_to_save(peft_config: PeftConfig, module_names: Sequence[str]) -
 
 
 def _disable_transformer_encoder_fastpath_for_tuner_layers(model: torch.nn.Module) -> None:
-    """Prevent PyTorch's fused TransformerEncoder path from bypassing PEFT-wrapped linears.
+    """Prevent PyTorch's fused TransformerEncoder path from bypassing PEFT-wrapped feed-forward layers.
 
     PyTorch's fused TransformerEncoderLayer kernel reads `.weight` and `.bias` directly for
-    `linear1`, `linear2`, and `self_attn.out_proj`; it does not call those modules' `forward()`
-    methods. PEFT adapters apply their unmerged contribution in `forward()`, so the fused path
-    silently drops the adapter. Mark affected layers as ineligible for that kernel while leaving
-    their actual activation unchanged. Also disable nested-tensor conversion on containing
-    TransformerEncoder modules, because that outer fast path requires the fused layer path.
+    `linear1` and `linear2`; it does not call those modules' `forward()` methods. PEFT adapters
+    apply their unmerged contribution in `forward()`, so the fused path silently drops the adapter.
+    Mark affected layers as ineligible for that kernel while leaving their actual activation unchanged.
+    Also disable nested-tensor conversion on containing TransformerEncoder modules, because that outer
+    fast path requires the fused layer path.
     """
     affected_layer_ids: set[int] = set()
 
@@ -153,11 +153,9 @@ def _disable_transformer_encoder_fastpath_for_tuner_layers(model: torch.nn.Modul
         if not isinstance(layer, torch.nn.TransformerEncoderLayer):
             continue
 
-        self_attn = getattr(layer, "self_attn", None)
         fastpath_modules = (
             getattr(layer, "linear1", None),
             getattr(layer, "linear2", None),
-            getattr(self_attn, "out_proj", None),
         )
         has_tuner_layer = any(
             module is not None and any(isinstance(child, BaseTunerLayer) for child in module.modules())
